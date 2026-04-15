@@ -4,7 +4,10 @@
   1) pip install -r requirements.txt
   2) vLLM 서버 실행:
        vllm serve Qwen/Qwen3-ASR-0.6B --port 8000
-  3) (선택) config.py 에서 HOTWORDS, LANGUAGE 등 설정
+  3) config.py 설정:
+       AUDIO_SOURCE = "loopback"  # 브라우저/유튜브 오디오
+       OUTPUT_FILE  = "transcript.txt"
+       HOTWORDS, LANGUAGE 등
 """
 
 import signal
@@ -22,11 +25,12 @@ from config import Config
 from asr_pipeline import HybridASRPipeline
 
 console = Console()
+cfg: Config = None  # main() 에서 초기화
 
 # ── 상태 저장 ──────────────────────────────────────────────
 state = {
     "realtime": "",
-    "finals": [],       # 확정된 발화 목록
+    "finals": [],    # (ts, text, is_err) 튜플 목록
     "status": "✅ 대기 중",
 }
 lock = threading.Lock()
@@ -37,13 +41,16 @@ lock = threading.Lock()
 def make_display() -> Layout:
     with lock:
         realtime = state["realtime"]
-        finals = state["finals"]
-        status = state["status"]
+        finals   = state["finals"]
+        status   = state["status"]
 
-    # 확정 텍스트 (최근 10개)
+    # 확정 텍스트 (최근 10개) — 오류는 빨간색 표시
     history_lines = []
-    for i, (ts, text) in enumerate(finals[-10:], 1):
-        history_lines.append(f"[dim]{ts}[/dim]  {text}")
+    for ts, text, is_err in finals[-10:]:
+        if is_err:
+            history_lines.append(f"[dim]{ts}[/dim]  [red]{text}[/red]")
+        else:
+            history_lines.append(f"[dim]{ts}[/dim]  {text}")
     history_str = "\n".join(history_lines) if history_lines else "[dim]아직 확정된 발화 없음[/dim]"
 
     layout = Layout()
@@ -63,7 +70,11 @@ def make_display() -> Layout:
         )
     )
     layout["final"].update(
-        Panel(history_str, title="[green]확정 텍스트 (Cohere Transcribe)")
+        Panel(
+            history_str,
+            title=f"[green]확정 텍스트 (Cohere Transcribe)  "
+                  f"[dim]→ {cfg.OUTPUT_FILE} / {cfg.OUTPUT_FILE.rsplit('.', 1)[0]}.err.txt",
+        )
     )
     return layout
 
@@ -75,13 +86,16 @@ def on_realtime(text: str):
         state["realtime"] = text
 
 
-def on_final(text: str):
+def on_final(text: str, is_err: bool, reason: str):
     ts = datetime.now().strftime("%H:%M:%S")
     with lock:
-        state["finals"].append((ts, text))
-        state["realtime"] = ""  # 확정되면 실시간 초기화
-    # 터미널에도 출력 (Live 밖에서도 보이도록)
-    console.print(f"\n[bold green][{ts}] 확정:[/bold green] {text}\n")
+        state["finals"].append((ts, text, is_err))
+        state["realtime"] = ""
+
+    if is_err:
+        console.print(f"\n[bold red][{ts}] 오류({reason}):[/bold red] {text}\n")
+    else:
+        console.print(f"\n[bold green][{ts}] 확정:[/bold green] {text}\n")
 
 
 def on_status(msg: str):
@@ -92,8 +106,11 @@ def on_status(msg: str):
 # ── 메인 ──────────────────────────────────────────────────
 
 def main():
+    global cfg
     cfg = Config()
 
+    src = "루프백(브라우저)" if cfg.AUDIO_SOURCE == "loopback" else "마이크"
+    console.print(f"[bold]오디오 소스: {src}  →  {cfg.OUTPUT_FILE}[/bold]")
     console.print("[bold]Cohere Transcribe 모델 로딩 중... (최초 1회, 수 분 소요)[/bold]")
     pipeline = HybridASRPipeline(
         cfg=cfg,

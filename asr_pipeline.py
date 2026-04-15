@@ -8,13 +8,16 @@ import asyncio
 import threading
 import queue
 import io
+import os
 import wave
 import base64
 import time
+from datetime import datetime
 from typing import Callable, Optional
 
 import numpy as np
 import sounddevice as sd
+import soundcard as sc
 import torch
 from openai import AsyncOpenAI
 from transformers import pipeline as hf_pipeline
@@ -46,14 +49,37 @@ def pcm_to_float32(pcm: bytes) -> np.ndarray:
 # ──────────────────────────────────────────────────────────
 
 class AudioCapture:
+    """
+    AUDIO_SOURCE = "mic"      → 마이크 입력 (sounddevice)
+    AUDIO_SOURCE = "loopback" → 시스템/브라우저 오디오 (soundcard WASAPI loopback)
+    """
+
+    CHUNK_SAMPLES = 512  # Silero VAD 고정 요구사항
+
     def __init__(self, cfg: Config, audio_queue: queue.Queue):
         self.cfg = cfg
         self.queue = audio_queue
-        # Silero VAD 요구: 16kHz 기준 512 샘플 (32ms) 고정
-        self.chunk_samples = 512
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
         self._stream: Optional[sd.InputStream] = None
 
     def start(self):
+        self._stop_event.clear()
+        if self.cfg.AUDIO_SOURCE == "loopback":
+            self._thread = threading.Thread(target=self._loopback_worker, daemon=True)
+            self._thread.start()
+        else:
+            self._start_mic()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._stream:
+            self._stream.stop()
+            self._stream.close()
+
+    # ── 마이크 모드 ────────────────────────────────────────
+
+    def _start_mic(self):
         def _cb(indata, frames, t, status):
             pcm = (indata[:, 0] * 32768).astype(np.int16).tobytes()
             self.queue.put(pcm)
@@ -62,15 +88,29 @@ class AudioCapture:
             samplerate=self.cfg.SAMPLE_RATE,
             channels=1,
             dtype="float32",
-            blocksize=self.chunk_samples,
+            blocksize=self.CHUNK_SAMPLES,
             callback=_cb,
         )
         self._stream.start()
 
-    def stop(self):
-        if self._stream:
-            self._stream.stop()
-            self._stream.close()
+    # ── 루프백(시스템 오디오) 모드 ─────────────────────────
+
+    def _loopback_worker(self):
+        """WASAPI loopback — 브라우저/유튜브 오디오 캡처"""
+        default_speaker = sc.default_speaker()
+        loopback_mic = sc.get_microphone(
+            default_speaker.id, include_loopback=True
+        )
+        with loopback_mic.recorder(
+            samplerate=self.cfg.SAMPLE_RATE,
+            channels=1,
+            blocksize=self.CHUNK_SAMPLES,
+        ) as recorder:
+            while not self._stop_event.is_set():
+                data = recorder.record(numframes=self.CHUNK_SAMPLES)
+                # soundcard → float32 (N, ch), 16-bit PCM으로 변환
+                pcm = (data[:, 0] * 32768).astype(np.int16).tobytes()
+                self.queue.put(pcm)
 
 
 # ──────────────────────────────────────────────────────────
@@ -232,7 +272,67 @@ class CohereOfflineASR:
 
 
 # ──────────────────────────────────────────────────────────
-# 5. 메인 파이프라인 오케스트레이터
+# 5. 파일 저장 및 오류 로깅
+# ──────────────────────────────────────────────────────────
+
+class TranscriptWriter:
+    """
+    확정 텍스트를 OUTPUT_FILE 에 append 저장.
+    오류/미인식은 OUTPUT_FILE.err.txt 에 기록.
+
+    오류 판단 기준:
+      - 텍스트가 비어 있거나 너무 짧음 (< 2자)
+      - 모델 오류 메시지 ([Qwen3 오류] / [Cohere 오류])
+      - 반복 hallucination (동일 단어가 전체의 70% 이상)
+    """
+
+    MIN_LENGTH = 2
+
+    def __init__(self, cfg: Config):
+        base, ext = os.path.splitext(cfg.OUTPUT_FILE)
+        ext = ext or ".txt"
+        self.output_file = cfg.OUTPUT_FILE
+        self.error_file  = f"{base}.err{ext}"
+
+    def write(self, text: str):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        is_err, reason = self._check_error(text)
+
+        if is_err:
+            self._append(self.error_file, f"[{ts}] [{reason}] {text}\n")
+        else:
+            self._append(self.output_file, f"[{ts}] {text}\n")
+
+        return is_err, reason
+
+    # ── 내부 ──────────────────────────────────────────────
+
+    def _check_error(self, text: str) -> tuple[bool, str]:
+        stripped = text.strip()
+
+        if len(stripped) < self.MIN_LENGTH:
+            return True, "EMPTY"
+
+        if stripped.startswith("[") and "오류" in stripped:
+            return True, "MODEL_ERROR"
+
+        # Hallucination: 단어 중복 비율 70% 초과
+        words = stripped.split()
+        if len(words) >= 6:
+            unique_ratio = len(set(words)) / len(words)
+            if unique_ratio < 0.3:
+                return True, "HALLUCINATION"
+
+        return False, ""
+
+    @staticmethod
+    def _append(path: str, line: str):
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+
+
+# ──────────────────────────────────────────────────────────
+# 6. 메인 파이프라인 오케스트레이터
 # ──────────────────────────────────────────────────────────
 
 class HybridASRPipeline:
@@ -240,16 +340,17 @@ class HybridASRPipeline:
     실시간(Qwen3) + 오프라인 확정(Cohere)을 동시에 운용하는 파이프라인.
 
     콜백:
-      on_realtime(text)  — 말하는 중 주기적으로 호출
-      on_final(text)     — 발화 종료 후 Cohere 확정 결과 호출
-      on_status(msg)     — 상태 메시지 (말하는 중 / 처리 중 등)
+      on_realtime(text)        — 말하는 중 주기적으로 호출
+      on_final(text, err, why) — 발화 종료 후 Cohere 확정 결과 호출
+                                 err=True 이면 오류 발화 (why: 사유)
+      on_status(msg)           — 상태 메시지 (말하는 중 / 처리 중 등)
     """
 
     def __init__(
         self,
         cfg: Config,
         on_realtime: Callable[[str], None],
-        on_final: Callable[[str], None],
+        on_final: Callable[[str, bool, str], None],
         on_status: Callable[[str], None],
     ):
         self.cfg = cfg
@@ -264,6 +365,7 @@ class HybridASRPipeline:
         self._vad = VADProcessor(cfg)
         self._qwen3 = Qwen3RealtimeASR(cfg)
         self._cohere = CohereOfflineASR(cfg)
+        self._writer = TranscriptWriter(cfg)
 
         self._running = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -340,6 +442,6 @@ class HybridASRPipeline:
                 continue
 
             text = self._cohere.transcribe(utterance)
-            if text:
-                self.on_final(text)
+            is_err, reason = self._writer.write(text)
+            self.on_final(text, is_err, reason)
             self.on_status("✅ 대기 중")
