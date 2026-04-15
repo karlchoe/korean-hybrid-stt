@@ -4,8 +4,20 @@
 
 말하는 중에는 Qwen3-ASR로 실시간 자막을 표시하고,
 발화가 끝나면 Cohere Transcribe로 고정밀 텍스트를 확정하여 파일에 저장하는 2단계 파이프라인.
+PyQt6 오버레이 창이 브라우저(YouTube) 위에 항상 표시되어 탭 전환 없이 자막 확인 가능.
 
 ```
+┌─────────────────────────────────────────┐
+│          브라우저 (YouTube 재생)           │
+│                                         │
+│   ┌─────────────────────────────────┐   │
+│   │  🎙 말하는 중...                  │   │
+│   │  [실시간] 지금 말하는 내용...      │ ← PyQt6 오버레이 (항상 위)
+│   │  [확정]  최종 확정된 텍스트       │   반투명 · 프레임리스 · 드래그 가능
+│   │  📄 transcript.txt  ✅ 저장됨    │   │
+│   └─────────────────────────────────┘   │
+└─────────────────────────────────────────┘
+
 [브라우저/유튜브]          [마이크]
   시스템 오디오               │
   WASAPI Loopback            │
@@ -15,9 +27,9 @@
                 ▼
           [Silero VAD]  ── 노이즈 차단, 발화 구간만 통과
                 │
-                ├── 발화 중 (2초마다) ──► [Qwen3-ASR-0.6B / vLLM]  ──► 실시간 자막 갱신
-                │
-                └── 발화 종료 ──────────► [Cohere Transcribe 2B]    ──► 최종 텍스트 확정
+                ├── 발화 중 (2초마다) ──► [Qwen3-ASR-0.6B / vLLM]  ──► PyQt6 실시간 자막 갱신
+                │                                                         (Qt Signal, 스레드 안전)
+                └── 발화 종료 ──────────► [Cohere Transcribe 2B]    ──► PyQt6 확정 텍스트 교체
                                                    │
                                          [TranscriptWriter]
                                            ├── transcript.txt      (정상, append)
@@ -89,29 +101,48 @@
   - `on_final(text, is_err, reason)` — 최종 텍스트 확정 (오류 여부 포함)
   - `on_status(msg)` — 상태 메시지
 
+### 7. PyQt6 오버레이 UI — main.py
+- 브라우저(YouTube) 위에 **항상 표시** (`WindowStaysOnTopHint`)
+- 반투명 배경 (`WA_TranslucentBackground`), 프레임리스 (`FramelessWindowHint`)
+- 드래그로 위치 이동 가능
+- **Qt Signal**로 파이프라인 콜백 수신 → 스레드 안전 UI 업데이트
+
+| 표시 영역 | 내용 | 스타일 |
+|----------|------|--------|
+| 상태바 | 말하는 중 / 분석 중 / 대기 중 | 노란색 |
+| 실시간 | Qwen3-ASR 스트리밍 텍스트 | 청록색, 2초마다 갱신 |
+| 확정 | Cohere 최종 텍스트 (최근 5개) | 흰색 / 오류는 빨간색 |
+| 파일 상태 | 저장 파일명 + 저장 확인 | 회색 |
+
 ---
 
 ## 스레드 모델
 
 ```
-Main Thread
-  └── Rich Live UI (0.5초 갱신)
+Main Thread (Qt Event Loop)
+  └── PyQt6 오버레이 창
+        ├── Qt Signal 수신 → UI 업데이트
+        └── 마우스 드래그 이벤트 처리
 
 AsyncIO Thread
   └── _vad_and_stream_loop()
         ├── audio_queue 소비
         ├── Silero VAD 처리
         └── Qwen3 await (스트리밍)
+              └── emit realtime_signal → Qt UI
 
 Offline Thread
   └── _offline_worker()
         ├── utterance_queue 소비
         ├── Cohere transcribe (동기)
-        └── TranscriptWriter.write()
+        ├── TranscriptWriter.write()
+        └── emit final_signal → Qt UI
 
 sounddevice / soundcard Thread
   └── 마이크 or 루프백 → audio_queue 생산
 ```
+
+> Qt Signal은 스레드 경계를 안전하게 넘기기 때문에 asyncio/멀티스레드 환경에서 UI 업데이트에 적합.
 
 ---
 
@@ -178,10 +209,14 @@ pip install -r requirements.txt
 vllm serve Qwen/Qwen3-ASR-0.6B --port 8000
 
 # 3. config.py 설정
-#    AUDIO_SOURCE = "loopback"  ← 브라우저/유튜브
+#    AUDIO_SOURCE = "loopback"  ← 브라우저/유튜브 (기본값)
 #    AUDIO_SOURCE = "mic"       ← 마이크
 #    OUTPUT_FILE  = "transcript.txt"
 
-# 4. 파이프라인 실행
+# 4. 브라우저에서 YouTube 재생
+
+# 5. 파이프라인 + PyQt6 오버레이 실행
 python main.py
+# → 오버레이 창이 브라우저 위에 표시됨
+# → 드래그로 원하는 위치로 이동 가능
 ```

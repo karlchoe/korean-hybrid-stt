@@ -7,6 +7,7 @@
 - **실시간 자막**: Qwen3-ASR-0.6B (vLLM 스트리밍)
 - **최종 확정**: Cohere Transcribe (오프라인 고정밀)
 - **VAD**: Silero VAD (딥러닝 기반 노이즈 필터링)
+- **UI**: PyQt6 반투명 오버레이 — 브라우저(YouTube) 위에 항상 표시, 탭 전환 불필요
 - **파일 저장**: 확정 텍스트 → `transcript.txt` / 오류 → `transcript.err.txt`
 
 자세한 구조는 `architecture.md` 참고.
@@ -25,7 +26,7 @@ stt/
 │   ├── CohereOfflineASR   HuggingFace 오프라인 전사
 │   ├── TranscriptWriter   파일 저장 + 오류 로깅
 │   └── HybridASRPipeline  오케스트레이터
-├── main.py            # 진입점 + Rich 터미널 UI
+├── main.py            # 진입점 + PyQt6 오버레이 UI
 ├── requirements.txt   # 의존성
 └── architecture.md    # 아키텍처 문서
 ```
@@ -68,6 +69,7 @@ python main.py
 - Silero VAD 는 torch.hub 에서 자동 다운로드 (최초 1회)
 - Cohere 모델은 HuggingFace 에서 자동 다운로드 (최초 1회, ~4GB)
 - **Windows 전용**: `soundcard` WASAPI 루프백은 Windows에서만 동작
+- PyQt6 (~50MB): Qt6 바이너리 내장, 별도 Qt 설치 불필요
 
 ---
 
@@ -98,11 +100,15 @@ python main.py
 - 현재 오류 판단: `EMPTY`(2자 미만) / `MODEL_ERROR` / `HALLUCINATION`(단어 반복 70%)
 - `MIN_LENGTH` 클래스 변수로 최소 길이 조정 가능
 
-### UI 수정
-- `main.py` → `make_display()` 함수
-- Rich `Layout` + `Panel` 구조
-- 오류 발화는 빨간색으로 표시
-- `on_realtime` / `on_final(text, is_err, reason)` / `on_status` 콜백으로 상태 수신
+### UI 수정 (PyQt6 오버레이)
+- `main.py` → `OverlayWindow` 클래스 (QWidget)
+- 항상 위: `Qt.WindowStaysOnTopHint` + `Qt.FramelessWindowHint`
+- 반투명: `WA_TranslucentBackground` + `setWindowOpacity()`
+- 드래그: `mousePressEvent` / `mouseMoveEvent` 오버라이드
+- 스레드 안전 업데이트: `QObject` 상속 + `pyqtSignal`
+  - `realtime_signal(str)` → 실시간 자막 레이블 갱신
+  - `final_signal(str, bool, str)` → 확정 텍스트 추가 + 오류 시 빨간색
+  - `status_signal(str)` → 상태바 텍스트 갱신
 
 ---
 
@@ -123,6 +129,9 @@ python main.py
 
 5. **루프백 캡처 Windows 전용**
    - macOS/Linux는 `AUDIO_SOURCE = "mic"` 사용 또는 BlackHole(mac) 등 가상 오디오 드라이버 필요
+
+6. **PyQt6 UI는 Qt 메인 스레드에서만 직접 업데이트 가능**
+   - 반드시 `pyqtSignal`을 통해 UI 갱신할 것 (직접 호출 시 크래시)
 
 ---
 
